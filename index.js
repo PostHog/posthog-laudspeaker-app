@@ -1,5 +1,3 @@
-import { createBuffer } from '@posthog/plugin-contrib'
-
 const alias = {
     userId: 'properties.alias',
     previousId: ['properties.distinct_id'],
@@ -211,18 +209,7 @@ function isValidObject(val) {
     return isObject(val) || Array.isArray(val) || typeof val === 'function'
 }
 
-export const jobs = {
-    uploadBatchToLaud: async (batch, meta) => {
-        // We'll retry 15 times using an exponential backoff mechanism
-        // The first retry happens in 3s, and the last in about 50min
-        if (batch.retriesPerformedSoFar >= 15) {
-            return
-        }
-        await sendToLaud(batch, meta)
-    },
-}
-
-export async function setupPlugin({ config, global, jobs }) {
+export async function setupPlugin({ config, global }) {
     const laudBase64AuthToken = Buffer.from(`${config.writeKey}:`).toString('base64')
 
     global.laudAuthHeader = {
@@ -232,18 +219,6 @@ export async function setupPlugin({ config, global, jobs }) {
     }
     global.writeKey = config.writeKey
     global.dataPlaneUrl = config.dataPlaneUrl
-
-    // Setup a buffer to group events to be sent to laudspeaker in the background at most every 60s
-    global.buffer = createBuffer({
-        limit: 5 * 1024 * 1024, // 5mb max
-        timeoutSeconds: 10,
-        onFlush: async (batch) => {
-            await sendToLaud(
-                { batch, retriesPerformedSoFar: 0, batchId: Math.floor(Math.random() * 1000000) }, // This is the first time we're trying to send the payload
-                { global, jobs }
-            )
-        },
-    })
 }
 
 function getElementByOrderZero(json) {
@@ -254,8 +229,7 @@ function getElementByOrderZero(json) {
 }
 
 
-// onEvent is used to export events without modifying them
-export async function onEvent(event, { config, global }) {
+export function composeWebhook(event, { config, global }) {
     let laudspeakerPayload = {}
     // add const value props
     constructPayload(laudspeakerPayload, event, constants, true)
@@ -326,59 +300,20 @@ export async function onEvent(event, { config, global }) {
             set(laudspeakerPayload, 'phCustom', userSet[config.phCustom])
         }
     }
-
-    // Add event to the buffer which will flush in the background
-    global.buffer.add(laudspeakerPayload, JSON.stringify(laudspeakerPayload).length)
-}
-
-async function sendToLaud(batch, { global, jobs }) {
     const payload = {
-        batch: batch.batch,
+        batch: [laudspeakerPayload],
         sentAt: new Date().toISOString(),
     }
-    const batchDescription = `${batch.batch.length} event${batch.batch.length > 1 ? 's' : ''}`
 
-    await fetch(global.dataPlaneUrl, {
+    return {
+        url: global.dataPlaneUrl,
         headers: {
             'Content-Type': 'application/json',
             ...global.laudAuthHeader.headers,
         },
         body: JSON.stringify(payload),
         method: 'POST',
-        timeout: 15000, // 15 seconds
-    }).then(
-        (res) => {
-            if (res.ok) {
-                console.log(`Flushed ${batchDescription} to ${global.dataPlaneUrl}`)
-            } else if (res.status >= 500) {
-                // Server error, retry the batch later
-                console.error(
-                    `Failed to submit ${batchDescription} to ${global.dataPlaneUrl} due to server error: ${res.status} ${res.statusText}`,
-                )
-                throw new RetryError(`Server error: ${res.status} ${res.statusText}`)
-            } else {
-                // node-fetch handles 300s internaly, so we're left with 400s here: skip the batch and move forward
-                // We might have old events in ClickHouse that don't pass new stricter checks, don't fail the whole export if that happens
-                console.warn(
-                    `Skipping ${batchDescription}, rejected by ${global.dataPlaneUrl}: ${res.status} ${res.statusText}`,
-                )
-            }
-        },
-        (err) => {
-            if (err.name === 'AbortError' || err.name === 'FetchError') {
-                // Network / timeout error, retry the batch later
-                // See https://github.com/node-fetch/node-fetch/blob/2.x/ERROR-HANDLING.md
-                console.error(
-                    `Failed to submit ${batchDescription} to ${global.dataPlaneUrl} due to network error`,
-                    err,
-                )
-                throw new RetryError(`Target is unreachable: ${(err as Error).message}`)
-            }
-            // Other errors are rethrown to stop the export
-            console.error(`Failed to submit ${batchDescription} to ${global.dataPlaneUrl} due to unexpected error`, err)
-            throw err
-        },
-    )
+    }
 }
 
 function constructPayload(outPayload, inPayload, mapping, direct = false) {

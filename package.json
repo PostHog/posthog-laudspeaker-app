@@ -9,6 +9,5 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-      "@posthog/plugin-contrib": "^0.0.5"
   }
 }
